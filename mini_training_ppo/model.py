@@ -33,6 +33,7 @@ class PPOConfig:
     episodes_per_epoch: int = 5
     max_steps_per_episode: int = 300
     gamma: float = 0.99
+    gae_lambda: float = 0.95
     actor_learning_rate: float = 3e-4
     critic_learning_rate: float = 6e-4
     hidden_sizes: tuple[int, ...] = (64, 32)

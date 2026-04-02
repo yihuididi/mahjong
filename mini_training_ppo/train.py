@@ -25,6 +25,7 @@ class PendingDecision:
 
 @dataclass
 class TrajectoryItem:
+    player: int
     observation: np.ndarray
     action_mask: np.ndarray
     action: int
@@ -34,6 +35,16 @@ class TrajectoryItem:
     next_observation: np.ndarray
     next_action_mask: np.ndarray
     done: bool
+
+
+@dataclass
+class RolloutItem:
+    observation: np.ndarray
+    action_mask: np.ndarray
+    action: int
+    old_log_prob: float
+    return_estimate: float
+    advantage: float
 
 
 @dataclass
@@ -101,7 +112,7 @@ def train_ppo(
 
     try:
         for epoch in range(1, config.epochs + 1):
-            trajectory: list[TrajectoryItem] = []
+            rollout: list[RolloutItem] = []
             aggregate_rewards = np.zeros(NUM_PLAYERS, dtype=np.float32)
             aggregate_stats = _empty_stats()
             episode_steps: list[int] = []
@@ -109,6 +120,7 @@ def train_ppo(
             draws = 0
 
             for _ in range(config.episodes_per_epoch):
+                episode_trajectories: list[list[TrajectoryItem]] = [[] for _ in range(NUM_PLAYERS)]
                 observation, action_mask, current_player = env.reset()
                 pending: list[PendingDecision | None] = [None] * NUM_PLAYERS
                 pending_rewards = np.zeros(NUM_PLAYERS, dtype=np.float32)
@@ -140,8 +152,9 @@ def train_ppo(
                             if pending[player] is None:
                                 continue
                             decision = pending[player]
-                            trajectory.append(
+                            episode_trajectories[player].append(
                                 TrajectoryItem(
+                                    player=player,
                                     observation=decision.observation,
                                     action_mask=decision.action_mask,
                                     action=decision.action,
@@ -164,8 +177,9 @@ def train_ppo(
 
                         if pending[current_player] is not None:
                             decision = pending[current_player]
-                            trajectory.append(
+                            episode_trajectories[current_player].append(
                                 TrajectoryItem(
+                                    player=current_player,
                                     observation=decision.observation,
                                     action_mask=decision.action_mask,
                                     action=decision.action,
@@ -190,39 +204,44 @@ def train_ppo(
                         draws += stats.get("draw_games", 0)
                         aggregate_rewards += episode_reward
                         episode_steps.append(step_count)
+                        _extend_rollout_with_episode_sequences(
+                            rollout=rollout,
+                            episode_trajectories=episode_trajectories,
+                            agent=agent,
+                            config=config,
+                        )
                         break
                 else:
                     aggregate_rewards += episode_reward
                     episode_steps.append(step_count)
                     _merge_stats(aggregate_stats, dict(getattr(env, "episode_stats", {})))
+                    _extend_rollout_with_episode_sequences(
+                        rollout=rollout,
+                        episode_trajectories=episode_trajectories,
+                        agent=agent,
+                        config=config,
+                    )
 
-            observations = np.stack([item.observation for item in trajectory], axis=0)
-            action_masks = np.stack([item.action_mask for item in trajectory], axis=0)
-            actions = np.asarray([item.action for item in trajectory], dtype=np.int64)
-            old_log_probs = np.asarray([item.old_log_prob for item in trajectory], dtype=np.float32)
-            rewards = np.asarray([item.reward for item in trajectory], dtype=np.float32)
-            values = np.asarray([item.value for item in trajectory], dtype=np.float32)
-            next_observations = np.stack([item.next_observation for item in trajectory], axis=0)
-            next_action_masks = np.stack([item.next_action_mask for item in trajectory], axis=0)
-            dones = np.asarray([item.done for item in trajectory], dtype=np.float32)
-            next_values = agent.values(next_observations)
-            next_values = np.where(dones > 0.0, 0.0, next_values)
-            returns = rewards + (1.0 - dones) * config.gamma * next_values
-            advantages = returns - values
+            observations = np.stack([item.observation for item in rollout], axis=0)
+            action_masks = np.stack([item.action_mask for item in rollout], axis=0)
+            actions = np.asarray([item.action for item in rollout], dtype=np.int64)
+            old_log_probs = np.asarray([item.old_log_prob for item in rollout], dtype=np.float32)
+            returns = np.asarray([item.return_estimate for item in rollout], dtype=np.float32)
+            advantages = np.asarray([item.advantage for item in rollout], dtype=np.float32)
 
             policy_loss, value_loss, entropy = agent.update(
                 observations=observations,
                 action_masks=action_masks,
                 actions=actions,
                 old_log_probs=old_log_probs,
-                returns=returns.astype(np.float32),
-                advantages=advantages.astype(np.float32),
+                returns=returns,
+                advantages=advantages,
             )
 
             summary = EpochSummary(
                 epoch=epoch,
                 episodes=config.episodes_per_epoch,
-                transitions=len(trajectory),
+                transitions=len(rollout),
                 mean_rewards=(aggregate_rewards / float(max(config.episodes_per_epoch, 1))).astype(np.float32),
                 policy_loss=policy_loss,
                 value_loss=value_loss,
@@ -265,6 +284,66 @@ def _empty_stats() -> dict[str, int]:
 def _merge_stats(target: dict[str, int], source: dict[str, int]) -> None:
     for key, value in source.items():
         target[key] = target.get(key, 0) + int(value)
+
+
+def compute_gae_returns_and_advantages(
+    rewards: np.ndarray,
+    values: np.ndarray,
+    next_values: np.ndarray,
+    dones: np.ndarray,
+    gamma: float,
+    gae_lambda: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    if not (
+        rewards.shape == values.shape == next_values.shape == dones.shape
+    ):
+        raise ValueError("GAE inputs must have matching shapes.")
+
+    advantages = np.zeros_like(rewards, dtype=np.float32)
+    gae = 0.0
+    for index in reversed(range(rewards.shape[0])):
+        nonterminal = 1.0 - float(dones[index])
+        delta = float(rewards[index]) + (gamma * float(next_values[index]) * nonterminal) - float(values[index])
+        gae = delta + (gamma * gae_lambda * nonterminal * gae)
+        advantages[index] = gae
+    returns = advantages + values.astype(np.float32)
+    return returns.astype(np.float32), advantages.astype(np.float32)
+
+
+def _extend_rollout_with_episode_sequences(
+    rollout: list[RolloutItem],
+    episode_trajectories: list[list[TrajectoryItem]],
+    agent: PPOAgent,
+    config: PPOConfig,
+) -> None:
+    for player_trajectory in episode_trajectories:
+        if not player_trajectory:
+            continue
+        next_observations = np.stack([item.next_observation for item in player_trajectory], axis=0)
+        next_values = agent.values(next_observations)
+        values = np.asarray([item.value for item in player_trajectory], dtype=np.float32)
+        rewards = np.asarray([item.reward for item in player_trajectory], dtype=np.float32)
+        dones = np.asarray([item.done for item in player_trajectory], dtype=np.float32)
+        next_values = np.where(dones > 0.0, 0.0, next_values)
+        returns, advantages = compute_gae_returns_and_advantages(
+            rewards=rewards,
+            values=values,
+            next_values=next_values.astype(np.float32),
+            dones=dones,
+            gamma=config.gamma,
+            gae_lambda=config.gae_lambda,
+        )
+        for item, return_estimate, advantage in zip(player_trajectory, returns, advantages):
+            rollout.append(
+                RolloutItem(
+                    observation=item.observation,
+                    action_mask=item.action_mask,
+                    action=item.action,
+                    old_log_prob=item.old_log_prob,
+                    return_estimate=float(return_estimate),
+                    advantage=float(advantage),
+                )
+            )
 
 
 def _log_epoch_summary(
@@ -325,6 +404,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--episodes-per-epoch", type=int, default=PPOConfig.episodes_per_epoch)
     parser.add_argument("--max-steps", type=int, default=PPOConfig.max_steps_per_episode)
     parser.add_argument("--gamma", type=float, default=PPOConfig.gamma)
+    parser.add_argument("--gae-lambda", type=float, default=PPOConfig.gae_lambda)
     parser.add_argument("--actor-learning-rate", type=float, default=PPOConfig.actor_learning_rate)
     parser.add_argument("--critic-learning-rate", type=float, default=PPOConfig.critic_learning_rate)
     parser.add_argument("--clip-ratio", type=float, default=PPOConfig.clip_ratio)
@@ -348,6 +428,7 @@ def main() -> None:
         episodes_per_epoch=args.episodes_per_epoch,
         max_steps_per_episode=args.max_steps,
         gamma=args.gamma,
+        gae_lambda=args.gae_lambda,
         actor_learning_rate=args.actor_learning_rate,
         critic_learning_rate=args.critic_learning_rate,
         clip_ratio=args.clip_ratio,
